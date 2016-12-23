@@ -1,4 +1,6 @@
 #include <memory>
+#include <type_traits>
+#include <cassert>
 
 ////////////////////////////////////////////////////////////////////////////////
 // Implementation detail classes
@@ -23,30 +25,30 @@ struct default_delete
 };
 
 template <typename T>
-struct control_block
+struct shared_control_block
 {
-  virtual ~control_block() = default;
-  virtual std::unique_ptr<control_block> clone() const = 0;
+  virtual ~shared_control_block() = default;
+  virtual std::shared_ptr<shared_control_block> clone() const = 0;
   virtual T* ptr() = 0;
 };
 
 template <typename T, typename U, typename C = default_copy<U>,
           typename D = default_delete<U>>
-class pointer_control_block : public control_block<T>
+class indirect_shared_control_block : public shared_control_block<T>
 {
   std::unique_ptr<U, D> p_;
   C c_;
 
 public:
-  explicit pointer_control_block(U* u, C c = C{}, D d = D{})
+  explicit indirect_shared_control_block(U* u, C c = C{}, D d = D{})
       : c_(std::move(c)), p_(u, std::move(d))
   {
   }
 
-  std::unique_ptr<control_block<T>> clone() const override
+  std::shared_ptr<shared_control_block<T>> clone() const override
   {
     assert(p_);
-    return std::make_unique<pointer_control_block>(c_(*p_), c_,
+    return std::make_shared<indirect_shared_control_block>(c_(*p_), c_,
                                                    p_.get_deleter());
   }
 
@@ -57,19 +59,19 @@ public:
 };
 
 template <typename T, typename U = T>
-class direct_control_block : public control_block<U>
+class direct_shared_control_block : public shared_control_block<U>
 {
   U u_;
 
 public:
   template <typename... Ts>
-  explicit direct_control_block(Ts&&... ts) : u_(U(std::forward<Ts>(ts)...))
+  explicit direct_shared_control_block(Ts&&... ts) : u_(U(std::forward<Ts>(ts)...))
   {
   }
 
-  std::unique_ptr<control_block<U>> clone() const override
+  std::shared_ptr<shared_control_block<U>> clone() const override
   {
-    return std::make_unique<direct_control_block>(*this);
+    return std::make_shared<direct_shared_control_block>(*this);
   }
 
   T* ptr() override
@@ -79,20 +81,20 @@ public:
 };
 
 template <typename T, typename U>
-class delegating_control_block : public control_block<T>
+class delegating_shared_control_block : public shared_control_block<T>
 {
 
-  std::unique_ptr<control_block<U>> delegate_;
+  std::unique_ptr<shared_control_block<U>> delegate_;
 
 public:
-  explicit delegating_control_block(std::unique_ptr<control_block<U>> b)
+  explicit delegating_shared_control_block(std::unique_ptr<shared_control_block<U>> b)
       : delegate_(std::move(b))
   {
   }
 
-  std::unique_ptr<control_block<T>> clone() const override
+  std::shared_ptr<shared_control_block<T>> clone() const override
   {
-    return std::make_unique<delegating_control_block>(delegate_->clone());
+    return std::make_shared<delegating_shared_control_block>(delegate_->clone());
   }
 
   T* ptr() override
@@ -122,45 +124,108 @@ template <typename T>
 class copy_on_write
 {
   T* ptr_ = nullptr;
-  std::shared_ptr<control_block<T>> cb_;
+  std::shared_ptr<shared_control_block<T>> cb_;
 
   void detach()
   {
     auto p = cb_->clone();
-    cb_ = std::shared_ptr<control_block<T>>(p.release());
+    cb_ = std::shared_ptr<shared_control_block<T>>(p.release());
     ptr_ = cb_->ptr();
   }
 
 public:
+
+  //
+  // Destructor
+  //
+
   ~copy_on_write() = default;
 
-  copy_on_write() = default;
+  //
+  // Constructors
+  //
 
-  copy_on_write(T t) : ptr_(std::make_shared<T>(std::move(t)))
+  copy_on_write()
   {
   }
 
-  copy_on_write(const copy_on_write& p) : ptr_(p.ptr_), cb_(p.cb_)
+  template <typename U, typename C = default_copy<U>,
+            typename D = default_delete<U>,
+            typename V = std::enable_if_t<std::is_convertible<U*, T*>::value>>
+  explicit copy_on_write(U* u, C copier = C{}, D deleter = D{})
+  {
+    if (!u)
+    {
+      return;
+    }
+
+    assert(typeid(*u) == typeid(U));
+
+    cb_ = std::make_unique<indirect_shared_control_block<T, U, C, D>>(
+        u, std::move(copier), std::move(deleter));
+    ptr_ = u;
+  }
+  
+  template<typename U, typename = std::enable_if_t<std::is_base_of<T,U>::value && !is_copy_on_write<U>::value>>
+  copy_on_write(U u) : copy_on_write(new U(std::move(u)))
   {
   }
 
-  copy_on_write(copy_on_write&& p) : ptr_(std::move(p.ptr_)), cb_(std::move(p.cb_))
+  //
+  // Copy constructors
+  //
+  
+  copy_on_write(const copy_on_write& c) : ptr_(c.ptr_), cb_(c.cb_)
   {
   }
 
-  copy_on_write& operator=(const copy_on_write& p)
+  //
+  // Move constructors
+  //
+  
+  copy_on_write(copy_on_write&& c) : ptr_(std::move(c.ptr_)), cb_(std::move(c.cb_))
   {
-    cb_ = p.cb_;
-    ptr_ = p.ptr_;
+    c.ptr_ = nullptr;
+  }
+  
+  //
+  // Copy assignment
+  //
+  
+  copy_on_write& operator=(const copy_on_write& c)
+  {
+    cb_ = c.cb_;
+    ptr_ = c.ptr_;
     return *this;
   }
 
-  copy_on_write& operator=(copy_on_write&& p)
+  //
+  // Move assignment
+  //
+ 
+  copy_on_write& operator=(copy_on_write&& c)
   {
-    cb_ = std::move(p.cb_);
-    ptr_ = std::move(p.ptr_);
+    cb_ = std::move(c.cb_);
+    ptr_ = std::move(c.ptr_);
+    c.ptr_ = nullptr;
     return *this;
   }
+
+  //
+  // Modifiers
+  //
+  
+  void swap(copy_on_write& c) noexcept
+  {
+    using std::swap;
+    swap(ptr_, c.ptr_);
+    swap(cb_, c.cb_);
+  }
+
+
+  //
+  // Observers
+  //
 
   explicit operator bool() const
   {
@@ -179,23 +244,13 @@ public:
     return ptr_;
   }
 
-  T& operator*()
-  {
-    assert(ptr_);
-    if (!cb_.shared())
-    {
-      detach();
-    }
-    return *ptr_;
-  }
+  //
+  // Mutator
+  //
 
-  T* operator->()
+  friend T* mutate(copy_on_write& c)
   {
-    assert(ptr_);
-    if (!cb_.shared())
-    {
-      detach();
-    }
-    return ptr_;
+    return c.ptr_;
   }
 };
+
