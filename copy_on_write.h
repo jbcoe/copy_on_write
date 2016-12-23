@@ -84,11 +84,11 @@ template <typename T, typename U>
 class delegating_shared_control_block : public shared_control_block<T>
 {
 
-  std::unique_ptr<shared_control_block<U>> delegate_;
+  std::shared_ptr<shared_control_block<U>> delegate_;
 
 public:
-  explicit delegating_shared_control_block(std::unique_ptr<shared_control_block<U>> b)
-      : delegate_(std::move(b))
+  explicit delegating_shared_control_block(std::shared_ptr<shared_control_block<U>> b)
+      : delegate_(b)
   {
   }
 
@@ -123,13 +123,17 @@ struct is_copy_on_write<copy_on_write<T>> : std::true_type
 template <typename T>
 class copy_on_write
 {
+  template <typename U>
+  friend class copy_on_write;
+  template <typename T_, typename... Ts>
+  friend copy_on_write<T_> make_copy_on_write(Ts&&... ts);
+
   T* ptr_ = nullptr;
   std::shared_ptr<shared_control_block<T>> cb_;
 
   void detach()
   {
-    auto p = cb_->clone();
-    cb_ = std::shared_ptr<shared_control_block<T>>(p.release());
+    cb_ = cb_->clone();
     ptr_ = cb_->ptr();
   }
 
@@ -165,8 +169,8 @@ public:
         u, std::move(copier), std::move(deleter));
     ptr_ = u;
   }
-  
-  template<typename U, typename = std::enable_if_t<std::is_base_of<T,U>::value && !is_copy_on_write<U>::value>>
+
+  template<typename U, typename = std::enable_if_t<std::is_convertible<U*, T*>::value && !is_copy_on_write<U>::value>>
   copy_on_write(U u) : copy_on_write(new U(std::move(u)))
   {
   }
@@ -174,47 +178,131 @@ public:
   //
   // Copy constructors
   //
-  
+
   copy_on_write(const copy_on_write& c) : ptr_(c.ptr_), cb_(c.cb_)
   {
+  }
+
+  template <typename U,
+            typename V = std::enable_if_t<!std::is_same<T, U>::value &&
+                                          std::is_convertible<U*, T*>::value>>
+  copy_on_write(const copy_on_write<U>& p)
+  {
+    copy_on_write<U> tmp(p);
+    ptr_ = tmp.ptr_;
+    cb_ = std::static_pointer_cast<shared_control_block<T>>(
+        std::make_shared<delegating_shared_control_block<T, U>>(
+            std::move(tmp.cb_)));
   }
 
   //
   // Move constructors
   //
-  
+
   copy_on_write(copy_on_write&& c) : ptr_(std::move(c.ptr_)), cb_(std::move(c.cb_))
   {
     c.ptr_ = nullptr;
   }
-  
+
+  template <typename U,
+            typename V = std::enable_if_t<!std::is_same<T, U>::value &&
+                                          std::is_convertible<U*, T*>::value>>
+  copy_on_write(copy_on_write<U>&& c)
+  {
+    ptr_ = c.ptr_;
+    cb_ = std::static_pointer_cast<shared_control_block<T>>(
+        std::make_shared<delegating_shared_control_block<T, U>>(
+            std::move(c.cb_)));
+    c.ptr_ = nullptr;
+  }
+
   //
   // Copy assignment
   //
-  
-  copy_on_write& operator=(const copy_on_write& c)
+
+  copy_on_write& operator=(const copy_on_write& p)
   {
-    cb_ = c.cb_;
-    ptr_ = c.ptr_;
+    if (&p == this)
+    {
+      return *this;
+    }
+
+    if (!p)
+    {
+      cb_.reset();
+      ptr_ = nullptr;
+      return *this;
+    }
+
+    auto tmp_cb = p.cb_->clone();
+    ptr_ = tmp_cb->ptr();
+    cb_ = std::move(tmp_cb);
     return *this;
   }
+
+  template <typename U,
+            typename V = std::enable_if_t<!std::is_same<T, U>::value &&
+                                          std::is_convertible<U*, T*>::value>>
+  copy_on_write& operator=(const copy_on_write<U>& p)
+  {
+    copy_on_write<U> tmp(p);
+    *this = std::move(tmp);
+    return *this;
+  }
+
+  template <typename U,
+            typename V = std::enable_if_t<std::is_convertible<U*, T*>::value &&
+                                          !is_copy_on_write<U>::value>>
+  copy_on_write& operator=(const U& u)
+  {
+    copy_on_write tmp(u);
+    *this = std::move(tmp);
+    return *this;
+  }
+
 
   //
   // Move assignment
   //
- 
-  copy_on_write& operator=(copy_on_write&& c)
+
+  copy_on_write& operator=(copy_on_write&& p) noexcept
   {
-    cb_ = std::move(c.cb_);
-    ptr_ = std::move(c.ptr_);
-    c.ptr_ = nullptr;
+    if (&p == this)
+    {
+      return *this;
+    }
+
+    cb_ = std::move(p.cb_);
+    ptr_ = p.ptr_;
+    p.ptr_ = nullptr;
+    return *this;
+  }
+
+  template <typename U,
+            typename V = std::enable_if_t<!std::is_same<T, U>::value &&
+                                          std::is_convertible<U*, T*>::value>>
+  copy_on_write& operator=(copy_on_write<U>&& p)
+  {
+    cb_ = std::make_unique<delegating_shared_control_block<T, U>>(std::move(p.cb_));
+    ptr_ = p.ptr_;
+    p.ptr_ = nullptr;
+    return *this;
+  }
+
+  template <typename U,
+            typename V = std::enable_if_t<std::is_convertible<U*, T*>::value &&
+                                          !is_copy_on_write<U>::value>>
+  copy_on_write& operator=(U&& u)
+  {
+    copy_on_write tmp(std::move(u));
+    *this = std::move(tmp);
     return *this;
   }
 
   //
   // Modifiers
   //
-  
+
   void swap(copy_on_write& c) noexcept
   {
     using std::swap;
@@ -243,6 +331,11 @@ public:
     assert(ptr_);
     return ptr_;
   }
+  
+  const T& value() const
+  {
+    return *ptr_;
+  }
 
   //
   // Mutator
@@ -250,7 +343,33 @@ public:
 
   friend T* mutate(copy_on_write& c)
   {
+    if ( c.ptr_ && ! c.cb_.unique() )
+    {
+      c.detach();
+    }
     return c.ptr_;
   }
+
+  //
+  // non-member swap
+  //
+
+  friend void swap(copy_on_write& t, copy_on_write& u) noexcept
+  {
+    t.swap(u);
+  }
 };
+
+//
+// copy_on_write creation
+//
+
+template <typename T, typename... Ts>
+copy_on_write<T> make_copy_on_write(Ts&&... ts)
+{
+  copy_on_write<T> p;
+  p.cb_ = std::make_unique<direct_shared_control_block<T>>(std::forward<Ts>(ts)...);
+  p.ptr_ = p.cb_->ptr();
+  return std::move(p);
+}
 
