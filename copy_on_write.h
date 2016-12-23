@@ -320,6 +320,11 @@ public:
     return bool(ptr_);
   }
 
+  bool unique() const
+  {
+    return cb_.unique();
+  }
+
   const T& operator*() const
   {
     assert(ptr_);

@@ -178,9 +178,12 @@ TEST_CASE("copy_on_write constructed with copier and deleter",
                                       delete d;
                                     });
   {
+    REQUIRE(cp.unique());
     auto cp2 = cp;
     REQUIRE(copy_count == 0);
+    REQUIRE(!cp.unique());
     mutate(cp);
+    REQUIRE(cp.unique());
     REQUIRE(copy_count == 1);
   }
   REQUIRE(deletion_count == 1);
