@@ -179,6 +179,8 @@ TEST_CASE("copy_on_write constructed with copier and deleter",
                                     });
   {
     auto cp2 = cp;
+    REQUIRE(copy_count == 0);
+    mutate(cp);
     REQUIRE(copy_count == 1);
   }
   REQUIRE(deletion_count == 1);
@@ -223,9 +225,9 @@ TEST_CASE("copy_on_write copy constructor","[copy_on_write.constructors]")
     copy_on_write<BaseType> original_cptr(new DerivedType(v));
     copy_on_write<BaseType> cptr(original_cptr);
 
-    THEN("values are distinct")
+    THEN("objects are shared")
     {
-      REQUIRE(&cptr.value() != &original_cptr.value());
+      REQUIRE(&cptr.value() == &original_cptr.value());
     }
 
     THEN("Operator-> calls the pointee method")
@@ -238,9 +240,9 @@ TEST_CASE("copy_on_write copy constructor","[copy_on_write.constructors]")
       REQUIRE((bool)cptr == true);
     }
 
-    THEN("object count is two")
+    THEN("object count is one (objects are shared)")
     {
-      REQUIRE(DerivedType::object_count == 2);
+      REQUIRE(DerivedType::object_count == 1);
     }
 
     WHEN("Changes are made to the original copy_on_write after copying")
@@ -706,33 +708,6 @@ struct ThrowsOnCopy : Tracked
 
   ThrowsOnCopy& operator=(const ThrowsOnCopy& rhs) = default;
 };
-
-TEST_CASE("Exception safety: throw in copy constructor", "[copy_on_write.exception_safety.copy]")
-{
-  GIVEN("A value-constructed copy_on_write to a ThrowsOnCopy")
-  {
-    const int v = 7;
-    copy_on_write<ThrowsOnCopy> cptr(new ThrowsOnCopy(v));
-
-    THEN("When copying to another copy_on_write, after an exception, the source remains valid")
-    {
-      Tracked::reset_counts();
-      REQUIRE_THROWS_AS(copy_on_write<ThrowsOnCopy> another = cptr, std::runtime_error);
-      REQUIRE(cptr->value_ == v);
-      REQUIRE(Tracked::ctor_count_ - Tracked::dtor_count_ == 0);
-    }
-
-    THEN("When copying to another copy_on_write, after an exception, the destination is not changed")
-    {
-      const int v2 = 5;
-      copy_on_write<ThrowsOnCopy> another(new ThrowsOnCopy(v2));
-      Tracked::reset_counts();
-      REQUIRE_THROWS_AS(another = cptr, std::runtime_error);
-      REQUIRE(another->value_ == v2);
-      REQUIRE(Tracked::ctor_count_ - Tracked::dtor_count_ == 0);
-    }
-  }
-}
 
 template <typename T>
 struct throwing_copier
